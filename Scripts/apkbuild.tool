@@ -239,17 +239,14 @@ if [ "$JDK_BIN" != "" ]; then
   export PATH="$JDK_BIN:$PATH"
 fi
 
-if [ "$BUILD_TYPE" == "Release" ] && [ "$ONS_ANDROID_KEYSTORE" == "" ]; then
-  if [ "$JDK_BIN" == "" ]; then
-    echo "Unable to find a complete JDK for release key generation, please provide JAVA_PATH or JAVA_HOME!"
-    exit 1
-  fi
-  KEYTOOL="$(resolve_tool "$JDK_BIN" keytool)"
-  KEYSTORE="$PKGPATH/Test.keystore"
-  rm -f "$KEYSTORE"
-  "$KEYTOOL" -genkeypair -validity 10000 \
-    -dname "CN=GB, OU=Selfsign, O=Xtova Corporation, L=Unknown, S=Unknown, C=Unknown" \
-    -keystore "$KEYSTORE" -storepass password -keypass password -alias Test -keyalg RSA -v
+if [ "$BUILD_TYPE" == "Release" ]; then
+  for envname in ONS_ANDROID_KEYSTORE ONS_ANDROID_KEYSTORE_PASSWORD ONS_ANDROID_KEY_ALIAS ONS_ANDROID_KEY_PASSWORD; do
+    if [ "${!envname}" == "" ]; then
+      echo "Release packaging requires the persistent signing identity; $envname is not set."
+      echo "Refusing to generate a replacement key because it would break upgrades from prior releases."
+      exit 1
+    fi
+  done
 fi
 
 if [ "$GRADLE" != "" ]; then
@@ -277,7 +274,6 @@ if [ "$APK_OUTPUT" == "" ] || [ ! -f "$APK_OUTPUT" ]; then
 fi
 
 cp "$APK_OUTPUT" "$SIGNED_APK"
-rm -f "$PKGPATH/Test.keystore"
 
 echo "Please grab your apk at $SIGNED_APK"
 

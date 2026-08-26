@@ -5,7 +5,7 @@ history belongs in Git, issues, and release notes rather than this document.
 
 ## Supported release targets
 
-- Current release: 1.3 (`20260824-new`).
+- Current release: 1.4 (`20260826-new`).
 - Windows 10 or newer, x86-64, built in MSYS2 UCRT64.
 - Android 11 or newer (API 30), arm64. Exercised on 15 and 16; see the
   device-coverage note in `Resources/Docs/Android.md` for what the floor has and
@@ -49,6 +49,12 @@ newer staging copy. Windows NDK extraction requires `bsdtar` or 7-Zip because
 Info-ZIP can corrupt executable line endings on that host. The Java/native
 startup contract, scoped-storage layout, and Android Studio workflow are
 documented in `Resources/Docs/Android.md`.
+Release packaging requires the persistent Android signing identity explicitly
+whether invoked through `apkbuild.tool` or Gradle directly; neither path falls
+back to a test identity or generates a replacement key. The identity was
+intentionally rotated for release 1.4 after the earlier private key became
+unavailable, so Android installations of 1.0 through 1.3 must be uninstalled
+before installing 1.4; subsequent releases can update 1.4 normally.
 
 The launcher supports user-selected game folders and preserves the release-1.2
 app-scoped save location for upgrades. Selected roots use the engine's
