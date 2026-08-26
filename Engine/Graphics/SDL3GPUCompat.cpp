@@ -5153,8 +5153,9 @@ void GPU_LogLargestLiveImages(size_t count) {
 	for (auto *image : sorted) {
 		if (!image)
 			continue;
-		sendToLog(LogLevel::Info, "    %5ux%-5u %2d bpp %6zu KB%s\n", image->w, image->h,
-		          image->bytes_per_pixel, imagePixelBytes(image) / 1024,
+		sendToLog(LogLevel::Info, "    %5ux%-5u %2d bpp %6llu KB%s\n", image->w, image->h,
+		          image->bytes_per_pixel,
+		          static_cast<unsigned long long>(imagePixelBytes(image) / 1024),
 		          image->target ? " (render target)" : "");
 	}
 }

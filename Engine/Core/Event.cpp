@@ -784,8 +784,9 @@ void ONScripter::updateFpsCounter(double averageFrameMs, double lastFrameMs) {
 	              perfFormatKb(static_cast<int64_t>(perfOverlay.liveTextureKb)).c_str());
 	perfOverlay.bodyLines[2] = buffer;
 
-	std::snprintf(buffer, sizeof(buffer), "IMG %zu live   POOL %zu img %s",
-	              perfOverlay.liveImages, perfOverlay.pooledImages,
+	std::snprintf(buffer, sizeof(buffer), "IMG %llu live   POOL %llu img %s",
+	              static_cast<unsigned long long>(perfOverlay.liveImages),
+	              static_cast<unsigned long long>(perfOverlay.pooledImages),
 	              perfFormatKb(static_cast<int64_t>(perfOverlay.pooledKb)).c_str());
 	perfOverlay.bodyLines[3] = buffer;
 

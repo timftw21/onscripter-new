@@ -2972,8 +2972,11 @@ void ONScripter::droidTrimMemory() {
 	auto reportImageMemory = [](const char *when) {
 		size_t images = 0, textureBytes = 0, pixelBytes = 0;
 		GPU_GetLiveImageMemory(images, textureBytes, pixelBytes);
-		sendToLog(LogLevel::Info, "Trim %s: %zu live images, %zu KB texture, %zu KB CPU pixels\n",
-		          when, images, textureBytes / 1024, pixelBytes / 1024);
+		sendToLog(LogLevel::Info, "Trim %s: %llu live images, %llu KB texture, %llu KB CPU pixels\n",
+		          when,
+		          static_cast<unsigned long long>(images),
+		          static_cast<unsigned long long>(textureBytes / 1024),
+		          static_cast<unsigned long long>(pixelBytes / 1024));
 	};
 
 	reportImageMemory("before");
@@ -2982,8 +2985,8 @@ void ONScripter::droidTrimMemory() {
 	GPU_LogLargestLiveImages(10);
 
 	const size_t freedBytes = gpu.releaseUnusedPooledImages();
-	sendToLog(LogLevel::Info, "Trim: released %zu KB of pooled images and cleared the caches\n",
-	          freedBytes / 1024);
+	sendToLog(LogLevel::Info, "Trim: released %llu KB of pooled images and cleared the caches\n",
+	          static_cast<unsigned long long>(freedBytes / 1024));
 	reportImageMemory("after");
 	gpu.logPooledImageCensus();
 }

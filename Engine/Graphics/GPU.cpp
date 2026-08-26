@@ -1542,8 +1542,11 @@ void TempGPUImagePool::addImages(int n) {
 
 void GPUController::logPooledImageCensus() {
 	auto report = [](const char *name, const TempGPUImagePool::Census &c) {
-		sendToLog(LogLevel::Info, "  %-8s %3zu images (%zu in use) %6zu KB\n",
-		          name, c.images, c.checkedOut, c.bytes / 1024);
+		sendToLog(LogLevel::Info, "  %-8s %3llu images (%llu in use) %6llu KB\n",
+		          name,
+		          static_cast<unsigned long long>(c.images),
+		          static_cast<unsigned long long>(c.checkedOut),
+		          static_cast<unsigned long long>(c.bytes / 1024));
 	};
 	report("canvas", canvasImagePool.census());
 	report("script", scriptImagePool.census());
@@ -1555,8 +1558,12 @@ void GPUController::logPooledImageCensus() {
 		typed.checkedOut += c.checkedOut;
 		typed.bytes += c.bytes;
 	}
-	sendToLog(LogLevel::Info, "  %-8s %3zu images (%zu in use) %6zu KB across %zu sizes\n",
-	          "typed", typed.images, typed.checkedOut, typed.bytes / 1024, typedImagePools.size());
+	sendToLog(LogLevel::Info, "  %-8s %3llu images (%llu in use) %6llu KB across %llu sizes\n",
+	          "typed",
+	          static_cast<unsigned long long>(typed.images),
+	          static_cast<unsigned long long>(typed.checkedOut),
+	          static_cast<unsigned long long>(typed.bytes / 1024),
+	          static_cast<unsigned long long>(typedImagePools.size()));
 }
 
 size_t TempGPUImagePool::clearUnused(bool require_empty) {
