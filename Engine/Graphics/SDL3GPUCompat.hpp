@@ -327,7 +327,15 @@ void SDLCALL GPU_Flip(GPU_Target *target);
 void GPU_SetPresentationSuspended(bool suspended);
 // True once per detected mismatch between canvas and swapchain aspect.
 bool GPU_TakeSurfaceGeometryStale();
+
 #endif
+
+// Live GPU image accounting. textureBytes is what the driver holds, pixelBytes
+// the CPU-side copies the engine keeps alongside them. Not Android-specific --
+// the definitions never were, and the performance counter reports them on every
+// platform.
+void GPU_GetLiveImageMemory(size_t &images, size_t &textureBytes, size_t &pixelBytes);
+void GPU_LogLargestLiveImages(size_t count);
 void SDLCALL GPU_RectangleFilled2(GPU_Target *target, GPU_Rect rect, SDL_Color color);
 Uint32 SDLCALL GPU_CompileShader_RW(GPU_ShaderEnum shader_type, SDL_RWops *shader_source, GPU_bool free_rwops);
 Uint32 SDLCALL GPU_LinkShaders(Uint32 shader_object1, Uint32 shader_object2);

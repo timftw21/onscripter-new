@@ -565,19 +565,30 @@ void ONScripter::initSDL() {
 			    case SDL_APP_WILLENTERBACKGROUND:
 				    sendToLog(LogLevel::Info, "lifecycle watch: will enter background\n");
 				    GPU_SetPresentationSuspended(true);
+				    ons.droidInBackground.store(true, std::memory_order_release);
 				    break;
 			    case SDL_APP_DIDENTERBACKGROUND:
 				    sendToLog(LogLevel::Info, "lifecycle watch: did enter background\n");
 				    GPU_SetPresentationSuspended(true);
+				    ons.droidInBackground.store(true, std::memory_order_release);
 				    break;
 			    case SDL_APP_WILLENTERFOREGROUND:
 				    sendToLog(LogLevel::Info, "lifecycle watch: will enter foreground\n");
 				    GPU_SetPresentationSuspended(false);
+				    ons.droidInBackground.store(false, std::memory_order_release);
 				    break;
 			    case SDL_APP_DIDENTERFOREGROUND:
 				    sendToLog(LogLevel::Info, "lifecycle watch: did enter foreground\n");
 				    GPU_SetPresentationSuspended(false);
+				    ons.droidInBackground.store(false, std::memory_order_release);
 				    ons.droidResumeRedraw.store(true, std::memory_order_release);
+				    break;
+			    case SDL_APP_LOWMEMORY:
+				    // Only a request here. Freeing GPU objects from this thread
+				    // would race the renderer, so the work happens in the frame
+				    // loop, which is also where it is cheap to do.
+				    sendToLog(LogLevel::Info, "lifecycle watch: low memory\n");
+				    ons.droidTrimRequested.store(true, std::memory_order_release);
 				    break;
 			    default:
 				    break;
@@ -996,6 +1007,21 @@ void ONScripter::enableWheelDownAdvance() {
 
 void ONScripter::setShowFPS() {
 	show_fps_counter = true;
+}
+
+/**
+ * Turns the performance counter on for this run.
+ *
+ * Reachable from the command line and, because ons.cfg goes through the same
+ * option parser, from a bare "perf-overlay" line in the game folder's ons.cfg.
+ * That second route is the only one on Android, which has no argv the user can
+ * edit and no keyboard to reach the toggle with.
+ */
+void ONScripter::setPerfOverlay() {
+	perf_overlay_enabled         = true;
+	fps_overlay_visible          = true;
+	fps_overlay_dirty            = true;
+	fps_overlay_refresh_required = true;
 }
 
 void ONScripter::setGameIdentifier(const char *gameid) {
@@ -2923,6 +2949,48 @@ void ONScripter::cleanImages() {
 
 	gpu.clearImagePools(true);
 }
+
+#if defined(DROID)
+void ONScripter::droidTrimMemory() {
+	// What the moreram script command does when the game itself notices it is
+	// short, done when Android says so instead.
+	//
+	// This matters more here than on a desktop. A backgrounded process holding
+	// a gigabyte is the first thing the low memory killer reaches for, and the
+	// bulk of it -- pooled render targets and cached textures -- is GPU memory,
+	// which the system cannot swap or compress. Handing it back is the only way
+	// the number comes down, and everything released here is rebuilt on demand.
+	{
+		Lock lock(&imageCache);
+		imageCache.clearAll();
+	}
+	{
+		Lock lock(&soundCache);
+		soundCache.clearAll();
+	}
+
+	auto reportImageMemory = [](const char *when) {
+		size_t images = 0, textureBytes = 0, pixelBytes = 0;
+		GPU_GetLiveImageMemory(images, textureBytes, pixelBytes);
+		sendToLog(LogLevel::Info, "Trim %s: %llu live images, %llu KB texture, %llu KB CPU pixels\n",
+		          when,
+		          static_cast<unsigned long long>(images),
+		          static_cast<unsigned long long>(textureBytes / 1024),
+		          static_cast<unsigned long long>(pixelBytes / 1024));
+	};
+
+	reportImageMemory("before");
+	gpu.logPooledImageCensus();
+	sendToLog(LogLevel::Info, "  largest live images:\n");
+	GPU_LogLargestLiveImages(10);
+
+	const size_t freedBytes = gpu.releaseUnusedPooledImages();
+	sendToLog(LogLevel::Info, "Trim: released %llu KB of pooled images and cleared the caches\n",
+	          static_cast<unsigned long long>(freedBytes / 1024));
+	reportImageMemory("after");
+	gpu.logPooledImageCensus();
+}
+#endif
 
 void ONScripter::disableGetButtonFlag() {
 	btndown_flag  = false;

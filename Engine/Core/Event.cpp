@@ -9,6 +9,7 @@
 
 #include "Engine/Core/ONScripter.hpp"
 #include "Engine/Components/Async.hpp"
+#include "Engine/Components/Fonts.hpp"
 #include "Engine/Components/Joystick.hpp"
 #include "Engine/Components/Window.hpp"
 #include "Engine/Layers/Media.hpp"
@@ -18,16 +19,45 @@
 #include <sys/wait.h>
 #endif
 
+#ifdef WIN32
+#include <windows.h>
+#endif
+
+#ifdef DROID
+#include <jni.h>
+#endif
+
+// Process and thread CPU accounting for the performance counter.
+#if defined(DROID) || defined(LINUX) || defined(MACOSX) || defined(IOS)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <numeric>
+#include <string>
+#include <thread>
 
 const uint32_t MAX_TOUCH_TAP_TIMESPAN{80};
 const uint32_t MAX_TOUCH_SWIPE_TIMESPAN{300};
 const int EVENT_QUEUE_IDLE_WAIT_MS{8};
 const float MIN_AUTO_FPS{30.0f};
 const float MAX_AUTO_FPS{360.0f};
+#if defined(DROID)
+// A visual novel gains nothing visible from a 120 or 144 Hz panel, and on a
+// device running from a battery the difference is not free. Drive the scene at
+// 60 at most; ONSActivity asks the panel to settle at the same rate, so the two
+// agree and no frame is shown for an uneven number of refreshes.
+const float DROID_MAX_AUTO_FPS{60.0f};
+// How long to idle per iteration while Android holds the surface. Short enough
+// that the resume is picked up without a visible delay, long enough that the
+// loop costs nothing meanwhile.
+const uint32_t DROID_BACKGROUND_IDLE_MS{50};
+#endif
 const uint64_t NANOS_PER_MILLISECOND{1000000ULL};
 const uint64_t STALE_FRAME_BASELINE_NS{250ULL * NANOS_PER_MILLISECOND};
 const uint64_t FPS_DISPLAY_UPDATE_INTERVAL_NS{250ULL * NANOS_PER_MILLISECOND};
@@ -70,6 +100,258 @@ static FramePacingTelemetry framePacingTelemetry;
 static bool framePacingTelemetryEnabled() {
 	const char *value = onsSDLGetEnv("ONS_SDL3_GPU_TELEMETRY");
 	return value && *value && std::strcmp(value, "0") != 0;
+}
+
+/* **************************************** *
+ * Performance counter
+ *
+ * Opt-in, and off unless --perf-overlay (or a perf-overlay line in ons.cfg)
+ * asked for it. Everything below is inert otherwise: the sampling hangs off
+ * the same fps_overlay_visible check the plain counter always used.
+ * **************************************** */
+
+// One sample per presented frame. 150 of them is two and a half seconds at 60
+// fps -- long enough to still hold a stutter you noticed, short enough that the
+// panel stays out of the way of the game.
+const size_t PERF_HISTORY_SAMPLES{150};
+const size_t PERF_BODY_LINES{4};
+
+// Everything except the frame history is sampled on this slower cadence. Reading
+// /proc costs a syscall and the pool census walks every pooled image; done per
+// frame that would show up in the very numbers the panel exists to report.
+const uint64_t PERF_SLOW_SAMPLE_INTERVAL_NS{500ULL * NANOS_PER_MILLISECOND};
+// How long a named section keeps being shown after the script stops declaring
+// it. The engine passes through gaps between waits constantly; without this
+// the label would blink to SCRIPT and read as noise rather than state.
+const uint64_t PERF_SECTION_HOLD_NS{600ULL * NANOS_PER_MILLISECOND};
+#if defined(DROID)
+// Android republishes the context every frame for its input layer.
+constexpr bool ONS_DROID_PUBLISHES_INPUT_CONTEXT{true};
+#else
+constexpr bool ONS_DROID_PUBLISHES_INPUT_CONTEXT{false};
+#endif
+
+struct PerfOverlayState {
+	std::array<float, PERF_HISTORY_SAMPLES> frameMs{};
+	size_t samplesWritten{0};
+
+	std::array<std::string, PERF_BODY_LINES> bodyLines;
+
+	// What the script is currently waiting for, and a colour for it. Kept apart
+	// from the numbers above because it answers a different question: not how
+	// fast the engine is going, but where in the game it is.
+	std::string sectionLabel;
+	uchar3 sectionColor{0xff, 0xff, 0xff};
+	uint64_t sectionSeenNanos{0};
+
+	uint64_t lastSlowSampleNanos{0};
+	uint64_t lastProcessCpuNanos{0};
+	uint64_t lastThreadCpuNanos{0};
+	// Negative means the platform does not hand this out cheaply; the panel
+	// prints "n/a" rather than a zero that would read as a measurement.
+	double processCpuPercent{-1.0};
+	double threadCpuPercent{-1.0};
+	int64_t residentKb{-1};
+
+	size_t liveImages{0};
+	size_t liveTextureKb{0};
+	size_t pooledImages{0};
+	size_t pooledKb{0};
+
+	unsigned cores{0};
+
+	void push(double ms) {
+		frameMs[samplesWritten % PERF_HISTORY_SAMPLES] = static_cast<float>(ms);
+		++samplesWritten;
+	}
+
+	size_t filled() const {
+		return std::min(samplesWritten, PERF_HISTORY_SAMPLES);
+	}
+
+	// Oldest first, so the graph reads left to right like every other one.
+	float sampleAt(size_t index) const {
+		const size_t oldest = samplesWritten > PERF_HISTORY_SAMPLES
+		                          ? samplesWritten % PERF_HISTORY_SAMPLES
+		                          : 0;
+		return frameMs[(oldest + index) % PERF_HISTORY_SAMPLES];
+	}
+};
+
+static PerfOverlayState perfOverlay;
+
+/**
+ * Process CPU time consumed so far, in nanoseconds, or 0 where the platform
+ * does not offer it.
+ *
+ * Summed across threads, so a fully busy quad core reports four seconds per
+ * elapsed second. That is the top(1) convention, and the one the numbers in
+ * dumpsys and in Resources/Docs/Android.md are already quoted in, so the panel
+ * can be compared against them directly.
+ */
+static uint64_t perfProcessCpuNanos() {
+#if defined(WIN32)
+	FILETIME creation, exit, kernel, user;
+	if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user))
+		return 0;
+	auto toNanos = [](const FILETIME &ft) {
+		ULARGE_INTEGER value;
+		value.LowPart  = ft.dwLowDateTime;
+		value.HighPart = ft.dwHighDateTime;
+		return static_cast<uint64_t>(value.QuadPart) * 100; // 100 ns ticks
+	};
+	return toNanos(kernel) + toNanos(user);
+#elif defined(DROID) || defined(LINUX) || defined(MACOSX) || defined(IOS)
+	rusage usage{};
+	if (getrusage(RUSAGE_SELF, &usage) != 0)
+		return 0;
+	auto toNanos = [](const timeval &tv) {
+		return static_cast<uint64_t>(tv.tv_sec) * 1000000000ULL +
+		       static_cast<uint64_t>(tv.tv_usec) * 1000ULL;
+	};
+	return toNanos(usage.ru_utime) + toNanos(usage.ru_stime);
+#else
+	return 0;
+#endif
+}
+
+/**
+ * CPU time consumed by the calling thread, in nanoseconds.
+ *
+ * This is the engine main loop, and it is the number that made the background
+ * spin obvious: a loop that is waiting costs nothing here, a loop that is
+ * polling reads close to 100 per cent whatever the rest of the process does.
+ */
+static uint64_t perfThreadCpuNanos() {
+#if defined(WIN32)
+	FILETIME creation, exit, kernel, user;
+	if (!GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user))
+		return 0;
+	auto toNanos = [](const FILETIME &ft) {
+		ULARGE_INTEGER value;
+		value.LowPart  = ft.dwLowDateTime;
+		value.HighPart = ft.dwHighDateTime;
+		return static_cast<uint64_t>(value.QuadPart) * 100;
+	};
+	return toNanos(kernel) + toNanos(user);
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+	timespec ts{};
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+		return 0;
+	return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+#else
+	return 0;
+#endif
+}
+
+/**
+ * Resident set size in KB, or -1 where it cannot be had cheaply.
+ *
+ * Only the /proc platforms are covered. Windows would want psapi linked and
+ * macOS would want the Mach headers, and neither is worth a link-time surprise
+ * on a target this change cannot be tested on -- both have a task manager that
+ * answers the same question. Android, which is what the counter is for, is
+ * covered.
+ */
+static int64_t perfResidentKb() {
+#if defined(DROID) || defined(LINUX)
+	std::FILE *statm = std::fopen("/proc/self/statm", "r");
+	if (!statm)
+		return -1;
+	unsigned long long totalPages = 0, residentPages = 0;
+	const int parsed = std::fscanf(statm, "%llu %llu", &totalPages, &residentPages);
+	std::fclose(statm);
+	if (parsed != 2)
+		return -1;
+	const long pageSize = sysconf(_SC_PAGESIZE);
+	if (pageSize <= 0)
+		return -1;
+	return static_cast<int64_t>(residentPages) * pageSize / 1024;
+#else
+	return -1;
+#endif
+}
+
+// Formats a KB count the way the panel wants it, or "n/a" for an absent value.
+static std::string perfFormatKb(int64_t kilobytes) {
+	if (kilobytes < 0)
+		return "n/a";
+	char buffer[32];
+	std::snprintf(buffer, sizeof(buffer), "%.0f MB", static_cast<double>(kilobytes) / 1024.0);
+	return buffer;
+}
+
+/**
+ * Names the input context the script is waiting in.
+ *
+ * The get*_flag set is the script declaring which keys a particular wait
+ * accepts, and wh.txt raises each of these in exactly one place, so they name
+ * the screen rather than merely hint at it:
+ *   getmclick -> *log_button_loop   (the backlog)
+ *   getpage   -> the backlog, the music box and the trophy list
+ *   gettab    -> *text_cwlp         (the novel's own click-wait)
+ *
+ * Checked most specific first: the backlog raises getpage as well.
+ *
+ * When no wait is declared the engine is between waits, so the label falls back
+ * to event_mode, which distinguishes running script from waiting on a timer.
+ */
+static const char *perfSectionName(int context, uchar3 &color) {
+	// Most specific first: the backlog raises the paged flag as well.
+	if (context & ONScripter::InputContextBacklog) {
+		color = {0xff, 0xc0, 0x40}; // amber
+		return "BACKLOG";
+	}
+	if (context & ONScripter::InputContextPaged) {
+		color = {0x60, 0xd0, 0xff}; // cyan
+		return "SCROLLABLE";
+	}
+	if (context & ONScripter::InputContextNovel) {
+		color = {0x80, 0xe0, 0x80}; // green
+		return "NOVEL";
+	}
+	if (context & ONScripter::InputContextMenu) {
+		color = {0xc0, 0xa0, 0xff}; // violet
+		return "MENU";
+	}
+	if (context & ONScripter::InputContextText) {
+		color = {0xa0, 0xd0, 0xa0};
+		return "TEXT";
+	}
+	return nullptr; // nothing declared; the caller decides what to show
+}
+
+/**
+ * Records the section for the panel, holding the last named one briefly.
+ *
+ * Called every frame rather than on the panel's own cadence. The script spends
+ * a good part of its time between waits with nothing declared, so sampling this
+ * four times a second lands in those gaps often enough to be misleading -- the
+ * first version of this read SCRIPT while a menu was plainly on screen.
+ */
+static void perfNoteSection(int context, uint64_t nowNanos) {
+	uchar3 color{0xff, 0xff, 0xff};
+	if (const char *name = perfSectionName(context, color)) {
+		perfOverlay.sectionLabel     = name;
+		perfOverlay.sectionColor     = color;
+		perfOverlay.sectionSeenNanos = nowNanos;
+		return;
+	}
+
+	if (perfOverlay.sectionSeenNanos != 0 &&
+	    nowNanos - perfOverlay.sectionSeenNanos < PERF_SECTION_HOLD_NS)
+		return; // still inside the hold; keep showing what it was
+
+	perfOverlay.sectionLabel = (context & ONScripter::InputContextBusy) ? "WAIT" : "SCRIPT";
+	perfOverlay.sectionColor = {0x90, 0x90, 0x90};
+}
+
+static std::string perfFormatPercent(double percent) {
+	if (percent < 0.0)
+		return "n/a";
+	char buffer[32];
+	std::snprintf(buffer, sizeof(buffer), "%.0f %%", percent);
+	return buffer;
 }
 
 enum {
@@ -272,7 +554,26 @@ void ONScripter::fetchEventsToQueue() {
 	SDL_Event event{};
 	SDL_Event tmp_event{};
 
-	while (SDL_WaitEventTimeout(&event, EVENT_QUEUE_IDLE_WAIT_MS)) {
+	// Take the next event, parking this thread when there is nothing to take.
+	//
+	// SDL_WaitEventTimeout is the natural way to write that and is what every
+	// other platform gets, but on Android it does not block -- it polls. The
+	// thread reported sixteen voluntary context switches in five seconds, none
+	// of them a wait, while burning a full core with the game sitting still on
+	// the title screen. Polling and sleeping by hand costs the same 8ms of
+	// latency and actually yields the CPU.
+	auto nextEvent = [](SDL_Event *e) -> bool {
+#if defined(DROID)
+		if (SDL_PollEvent(e))
+			return true;
+		SDL_Delay(EVENT_QUEUE_IDLE_WAIT_MS);
+		return false;
+#else
+		return SDL_WaitEventTimeout(e, EVENT_QUEUE_IDLE_WAIT_MS) != 0;
+#endif
+	};
+
+	while (nextEvent(&event)) {
 		// ignore continuous SDL_MOUSEMOTION
 		while (event.type == SDL_MOUSEMOTION) {
 			if (SDL_PeepEvents(&tmp_event, 1, SDL_PEEKEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT) == 0)
@@ -327,7 +628,11 @@ float ONScripter::effectiveRefreshRate() const {
 
 	float detected_fps = window.currentDisplayRefreshRate();
 	if (detected_fps >= MIN_AUTO_FPS && detected_fps <= MAX_AUTO_FPS)
+#if defined(DROID)
+		return std::min(detected_fps, DROID_MAX_AUTO_FPS);
+#else
 		return detected_fps;
+#endif
 
 	if (game_fps > 0)
 		return static_cast<float>(game_fps);
@@ -344,35 +649,148 @@ double ONScripter::currentScriptFrameDeltaScale() const {
 }
 
 void ONScripter::toggleFpsOverlay() {
+	// The toggle only reaches an overlay the configuration asked for. Without
+	// that there is nothing to show and no sampling running to show it from.
+	if (!perf_overlay_enabled) {
+		sendToLog(LogLevel::Info, "FPS overlay is off; enable it with --perf-overlay or a perf-overlay line in ons.cfg\n");
+		return;
+	}
+
 	fps_overlay_visible          = !fps_overlay_visible;
 	fps_overlay_dirty            = true;
 	fps_overlay_refresh_required = true;
 
 	if (fps_overlay_text.empty())
-		fps_overlay_text = "FPS: --.-";
+		fps_overlay_text = "FPS --.-";
 
 	sendToLog(LogLevel::Info, "turned %s FPS overlay\n", fps_overlay_visible ? "on" : "off");
 }
 
-void ONScripter::updateFpsCounter(double frameMilliseconds) {
-	if (frameMilliseconds <= 0.0)
+/**
+ * Takes one frame of samples and, four times a second, rebuilds the panel text.
+ *
+ * averageFrameMs is the smoothed value the headline fps is derived from, so the
+ * number does not flicker. lastFrameMs is the frame that just went out, unsmoothed,
+ * because a graph that averages away spikes is a graph that hides the only thing
+ * worth looking at.
+ */
+void ONScripter::updateFpsCounter(double averageFrameMs, double lastFrameMs) {
+	if (averageFrameMs <= 0.0)
 		return;
 
-	displayed_fps = 1000.0 / frameMilliseconds;
+	displayed_fps = 1000.0 / averageFrameMs;
+
+	if (!perf_overlay_enabled) {
+		// Plain counter: the headline only, and none of the sampling below.
+		static uint64_t lastPlainUpdateNanos = 0;
+		const uint64_t plainNowNanos         = highResolutionTicksNanos();
+		if (!fps_overlay_text.empty() &&
+		    plainNowNanos - lastPlainUpdateNanos < FPS_DISPLAY_UPDATE_INTERVAL_NS)
+			return;
+		lastPlainUpdateNanos = plainNowNanos;
+
+		char label[32];
+		std::snprintf(label, sizeof(label), "FPS %.1f", displayed_fps);
+		if (fps_overlay_text != label) {
+			fps_overlay_text  = label;
+			fps_overlay_dirty = true;
+		}
+		return;
+	}
+
+	perfOverlay.push(lastFrameMs > 0.0 ? lastFrameMs : averageFrameMs);
+
+	const uint64_t nowNanos = highResolutionTicksNanos();
+
+	// The costly samples run on their own, slower cadence.
+	if (perfOverlay.lastSlowSampleNanos == 0 ||
+	    nowNanos - perfOverlay.lastSlowSampleNanos >= PERF_SLOW_SAMPLE_INTERVAL_NS) {
+		const uint64_t elapsedNanos = nowNanos - perfOverlay.lastSlowSampleNanos;
+		const uint64_t processNanos = perfProcessCpuNanos();
+		const uint64_t threadNanos  = perfThreadCpuNanos();
+
+		if (perfOverlay.lastSlowSampleNanos != 0 && elapsedNanos > 0) {
+			if (processNanos > 0 && processNanos >= perfOverlay.lastProcessCpuNanos)
+				perfOverlay.processCpuPercent =
+				    static_cast<double>(processNanos - perfOverlay.lastProcessCpuNanos) * 100.0 /
+				    static_cast<double>(elapsedNanos);
+			if (threadNanos > 0 && threadNanos >= perfOverlay.lastThreadCpuNanos)
+				perfOverlay.threadCpuPercent =
+				    static_cast<double>(threadNanos - perfOverlay.lastThreadCpuNanos) * 100.0 /
+				    static_cast<double>(elapsedNanos);
+		}
+
+		perfOverlay.lastProcessCpuNanos = processNanos;
+		perfOverlay.lastThreadCpuNanos  = threadNanos;
+		perfOverlay.lastSlowSampleNanos = nowNanos;
+		perfOverlay.residentKb          = perfResidentKb();
+		if (perfOverlay.cores == 0)
+			perfOverlay.cores = std::thread::hardware_concurrency();
+
+#if defined(ONS_USE_SDL3)
+		// What the engine itself is holding, as opposed to what dumpsys attributes
+		// to the process. The gap between the two is the driver allocation the
+		// Android backlog is still trying to account for.
+		size_t images = 0, textureBytes = 0, pixelBytes = 0;
+		GPU_GetLiveImageMemory(images, textureBytes, pixelBytes);
+		perfOverlay.liveImages    = images;
+		perfOverlay.liveTextureKb = (textureBytes + pixelBytes) / 1024;
+#endif
+		const auto pooled        = gpu.pooledImageCensus();
+		perfOverlay.pooledImages = pooled.images;
+		perfOverlay.pooledKb     = pooled.bytes / 1024;
+	}
 
 	static uint64_t lastOverlayUpdateNanos = 0;
-	uint64_t nowNanos = highResolutionTicksNanos();
-	if (!fps_overlay_text.empty() &&
+	if (lastOverlayUpdateNanos != 0 &&
 	    nowNanos - lastOverlayUpdateNanos < FPS_DISPLAY_UPDATE_INTERVAL_NS)
 		return;
 	lastOverlayUpdateNanos = nowNanos;
 
-	char label[32];
-	std::snprintf(label, sizeof(label), "FPS: %.1f", displayed_fps);
-	if (fps_overlay_text != label) {
-		fps_overlay_text  = label;
-		fps_overlay_dirty = true;
+	// Best and worst frame across the whole history, which is what the low and
+	// high figures report -- an average would never show the frame that hitched.
+	double bestMs = 0.0, worstMs = 0.0;
+	for (size_t i = 0, count = perfOverlay.filled(); i < count; ++i) {
+		const double ms = perfOverlay.sampleAt(i);
+		if (ms <= 0.0)
+			continue;
+		if (bestMs == 0.0 || ms < bestMs)
+			bestMs = ms;
+		if (ms > worstMs)
+			worstMs = ms;
 	}
+
+	const double targetMs = 1000.0 / std::max(1.0f, effectiveRefreshRate());
+
+	char buffer[192];
+	std::snprintf(buffer, sizeof(buffer), "FPS %.1f   low %.1f   high %.1f",
+	              displayed_fps,
+	              worstMs > 0.0 ? 1000.0 / worstMs : 0.0,
+	              bestMs > 0.0 ? 1000.0 / bestMs : 0.0);
+	fps_overlay_text = buffer;
+
+	std::snprintf(buffer, sizeof(buffer), "FRAME %.1f ms   worst %.1f ms   target %.1f ms",
+	              averageFrameMs, worstMs, targetMs);
+	perfOverlay.bodyLines[0] = buffer;
+
+	std::snprintf(buffer, sizeof(buffer), "CPU %s   loop %s   %u cores",
+	              perfFormatPercent(perfOverlay.processCpuPercent).c_str(),
+	              perfFormatPercent(perfOverlay.threadCpuPercent).c_str(),
+	              perfOverlay.cores);
+	perfOverlay.bodyLines[1] = buffer;
+
+	std::snprintf(buffer, sizeof(buffer), "RSS %s   GPU %s",
+	              perfFormatKb(perfOverlay.residentKb).c_str(),
+	              perfFormatKb(static_cast<int64_t>(perfOverlay.liveTextureKb)).c_str());
+	perfOverlay.bodyLines[2] = buffer;
+
+	std::snprintf(buffer, sizeof(buffer), "IMG %llu live   POOL %llu img %s",
+	              static_cast<unsigned long long>(perfOverlay.liveImages),
+	              static_cast<unsigned long long>(perfOverlay.pooledImages),
+	              perfFormatKb(static_cast<int64_t>(perfOverlay.pooledKb)).c_str());
+	perfOverlay.bodyLines[3] = buffer;
+
+	fps_overlay_dirty = true;
 }
 
 void ONScripter::printFramePacingTelemetry() const {
@@ -424,17 +842,48 @@ void ONScripter::printFramePacingTelemetry() const {
 	            framePacingTelemetry.maxFpsDisplayValue);
 }
 
+/**
+ * Draws the counter into its own cached texture and blits that to the screen.
+ *
+ * The texture is rebuilt only when the text changes, which is four times a
+ * second. That matters more than it looks: a counter that costs a text layout
+ * and a few hundred rectangles every frame changes the frame time it is there to
+ * report. The graph still shows every frame, because the history is sampled per
+ * frame and only drawn on the slower cadence.
+ */
 void ONScripter::drawFpsOverlay() {
 	if (!fps_overlay_visible || !screen_target)
 		return;
 
-	constexpr uint16_t overlayWidth  = 170;
-	constexpr uint16_t overlayHeight = 44;
-	constexpr float overlayX         = 16.0f;
-	constexpr float overlayY         = 16.0f;
+	const bool detailed = perf_overlay_enabled;
+
+	// Sized from the monospace advance, 0.6 em: the longest row is 46 characters,
+	// so at 17 px that is 460 px of text and the panel has to be at least 484
+	// wide. Undersizing it does not merely crop -- the row wraps, and the wrapped
+	// remainder lands on top of the row below. The fallback face measures 0.603,
+	// which the 500 here absorbs.
+	constexpr uint16_t padding      = 12;
+	constexpr uint16_t headlineY    = 8;
+	constexpr uint16_t headlineSize = 22;
+	constexpr uint16_t graphY       = 38;
+	constexpr uint16_t graphHeight  = 40;
+	constexpr uint16_t bodyY        = graphY + graphHeight + 10;
+	constexpr uint16_t bodySize     = 17;
+	constexpr uint16_t bodyStep     = 22;
+	// The section sits below the numbers and is set larger, because it is the one
+	// line worth finding without reading.
+	constexpr uint16_t sectionSize  = 20;
+	constexpr uint16_t sectionGap   = 8;
+
+	const uint16_t overlayWidth  = detailed ? 500 : 170;
+	const uint16_t sectionY = static_cast<uint16_t>(bodyY + PERF_BODY_LINES * bodyStep + sectionGap);
+	const uint16_t overlayHeight =
+	    detailed ? static_cast<uint16_t>(sectionY + sectionSize + 10) : 44;
+	constexpr float overlayX = 16.0f;
+	constexpr float overlayY = 16.0f;
 
 	if (fps_overlay_text.empty())
-		fps_overlay_text = "FPS: --.-";
+		fps_overlay_text = "FPS --.-";
 
 	if (!fps_overlay_gpu || fps_overlay_gpu->w != overlayWidth || fps_overlay_gpu->h != overlayHeight) {
 		if (fps_overlay_gpu)
@@ -446,22 +895,40 @@ void ONScripter::drawFpsOverlay() {
 
 	if (fps_overlay_dirty) {
 		auto *target = GPU_GetTarget(fps_overlay_gpu);
+
+		// The panel background is translucent, so it tints what is underneath
+		// rather than replacing it. Without a clear first, the previous reading
+		// stays visible under the new one.
+		gpu.clearWholeTarget(target);
 		SDL_Color background{0, 0, 0, 180};
 		GPU_Rect backgroundRect{0, 0, static_cast<float>(overlayWidth), static_cast<float>(overlayHeight)};
 		GPU_RectangleFilled2(target, backgroundRect, background);
 
-		Fontinfo font = sentence_font;
+		Fontinfo font      = sentence_font;
 		font.reset();
-		font.top_xy[0]   = 10;
-		font.top_xy[1]   = 7;
 		font.borderPadding = 2;
 
+		// A counter whose columns shift about as the digits change is hard to read
+		// at a glance, so take the host's monospace face when there is one.
+		//
+		// Font 0 when there is not. That is the game's default.ttf, and in Umineko
+		// it happens to serve: Sazanami Gothic's halfwidth Latin is fixed width
+		// even though the face as a whole is not. See loadMonospaceFont.
+		//
+		// preset_id is cleared because a preset override would otherwise redirect
+		// the slot back to a game font.
+		const bool monospace = fonts.monospaceLoaded;
+
 		auto &style              = font.changeStyle();
+		style.font_number        = monospace ? FontsController::MonospaceSlot : 0;
+		style.preset_id          = -1;
 		style.color              = {0xff, 0xff, 0xff};
 		style.is_gradient        = false;
 		style.is_centered        = false;
 		style.is_fitted          = false;
-		style.is_bold            = true;
+		// The monospace face has no bold companion, and asking for one only sends
+		// Font::setBold down the alias path. The border already carries the contrast.
+		style.is_bold            = !monospace;
 		style.is_italic          = false;
 		style.is_shadow          = false;
 		style.shadow_distance[0] = 0;
@@ -469,13 +936,80 @@ void ONScripter::drawFpsOverlay() {
 		style.is_border          = true;
 		style.border_width       = 40;
 		style.border_color       = {0, 0, 0};
-		style.font_size          = 24;
-		style.character_spacing = 0;
-		style.line_height        = 30;
-		style.wrap_limit         = overlayWidth - 20;
+		style.character_spacing  = 0;
+		style.no_break           = true;
+		style.wrap_limit         = overlayWidth * 4;
 
 		RenderRect clip{0, 0, static_cast<float>(overlayWidth), static_cast<float>(overlayHeight)};
-		dlgCtrl.renderToTarget(target, &clip, const_cast<char *>(fps_overlay_text.c_str()), &font, false, FIT_MODE::FIT_BOTH);
+
+		// renderToTarget takes its own copy of the Fontinfo, so each line is laid
+		// out independently and placing them is just a matter of the y origin.
+		auto drawLine = [&](const std::string &text, int y, int size) {
+			if (text.empty())
+				return;
+			font.top_xy[0]    = padding;
+			font.top_xy[1]    = y;
+			style.font_size   = size;
+			style.line_height = size + 6;
+			dlgCtrl.renderToTarget(target, &clip, const_cast<char *>(text.c_str()), &font, false,
+			                       FIT_MODE::FIT_BOTH);
+		};
+
+		drawLine(fps_overlay_text, detailed ? headlineY : 7, detailed ? headlineSize : 24);
+
+		if (detailed) {
+			// Frame time history. Full scale is twice the target frame time, so the
+			// midline is the frame budget and a bar above it is a frame that missed.
+			const float graphX     = padding;
+			const float graphWidth = static_cast<float>(overlayWidth - 2 * padding);
+			GPU_RectangleFilled2(target, GPU_Rect{graphX, static_cast<float>(graphY), graphWidth,
+			                                      static_cast<float>(graphHeight)},
+			                     SDL_Color{16, 16, 16, 210});
+
+			const double targetMs    = 1000.0 / std::max(1.0f, effectiveRefreshRate());
+			const double fullScaleMs = targetMs * 2.0;
+			const size_t count       = perfOverlay.filled();
+			const float barWidth     = graphWidth / static_cast<float>(PERF_HISTORY_SAMPLES);
+
+			for (size_t i = 0; i < count; ++i) {
+				const double ms = perfOverlay.sampleAt(i);
+				if (ms <= 0.0)
+					continue;
+				const double normalised = std::min(1.0, ms / fullScaleMs);
+				const float barHeight   = static_cast<float>(normalised * graphHeight);
+
+				SDL_Color bar{80, 220, 110, 235};
+				if (ms > targetMs * 1.5)
+					bar = SDL_Color{230, 80, 70, 235};
+				else if (ms > targetMs * 1.05)
+					bar = SDL_Color{235, 200, 60, 235};
+
+				GPU_RectangleFilled2(target,
+				                     GPU_Rect{graphX + static_cast<float>(i) * barWidth,
+				                              static_cast<float>(graphY + graphHeight) - barHeight,
+				                              barWidth, barHeight},
+				                     bar);
+			}
+
+			// The budget line, so a frame that overran is visible without reading numbers.
+			GPU_RectangleFilled2(target,
+			                     GPU_Rect{graphX, static_cast<float>(graphY + graphHeight / 2), graphWidth, 1.0f},
+			                     SDL_Color{255, 255, 255, 90});
+
+			for (size_t i = 0; i < PERF_BODY_LINES; ++i)
+				drawLine(perfOverlay.bodyLines[i], bodyY + static_cast<int>(i) * bodyStep, bodySize);
+
+			// Coloured, so the section reads at a glance rather than being one more
+			// row of text. The colour is restored afterwards in case anything else
+			// is ever drawn from this Fontinfo.
+			if (!perfOverlay.sectionLabel.empty()) {
+				const uchar3 previous = style.color;
+				style.color           = perfOverlay.sectionColor;
+				drawLine(perfOverlay.sectionLabel, sectionY, sectionSize);
+				style.color = previous;
+			}
+		}
+
 		fps_overlay_dirty = false;
 	}
 
@@ -533,6 +1067,43 @@ void ONScripter::waitEvent(int count, bool nopPreferred) {
 	bool resetFramePacing      = lastFlipTimeNanos == 0 || thisCallTimeNanos - lastFlipTimeNanos > STALE_FRAME_BASELINE_NS;
 
 	do {
+#if defined(DROID)
+		// Android has the surface, so nothing drawn from here can be seen.
+		//
+		// This has to be tested inside the loop, not once on the way in: the
+		// idle wait for a click is the count < 0 case, which never returns, and
+		// that is exactly when the player switches away. The flag comes from the
+		// lifecycle watch because the queued SDL_APP_WILLENTERBACKGROUND that
+		// used to clear allow_rendering never arrives -- SDL blocks the thread
+		// that would pump it, so the engine kept rendering the scene at the
+		// panel's refresh rate for an invisible window until Android killed it
+		// for burning CPU while cached.
+		//
+		// allow_rendering is restored by the resume block further down, which
+		// already forces the repaint the returning surface needs.
+		if (droidInBackground.load(std::memory_order_acquire)) {
+			allow_rendering = false;
+			SDL_Delay(DROID_BACKGROUND_IDLE_MS);
+		}
+
+		// Android asks for memory back on its own schedule, including as the
+		// app leaves the screen. This is the only thread that may free GPU
+		// objects, so the watch only raises the request and it is served here.
+		if (droidTrimRequested.exchange(false, std::memory_order_acq_rel))
+			droidTrimMemory();
+#endif
+
+		// Both consumers want this per frame: Java reads it whenever a finger
+		// goes down, and the panel needs to see the waits rather than the gaps
+		// between them. It is only a handful of branches.
+		if (perf_overlay_enabled || ONS_DROID_PUBLISHES_INPUT_CONTEXT) {
+			const int context = currentInputContext();
+#if defined(DROID)
+			androidInputContext.store(context, std::memory_order_release);
+#endif
+			if (perf_overlay_enabled)
+				perfNoteSection(context, highResolutionTicksNanos());
+		}
 		uint64_t framesOvershoot = 0;
 		uint64_t nanosPerFrame   = fps->nanosPerFrame();
 		uint64_t timeThisFrame{nanosPerFrame};
@@ -721,7 +1292,7 @@ void ONScripter::waitEvent(int count, bool nopPreferred) {
 				                                                   framePacingTelemetry.lastFpsDisplayValue);
 			}
 			if (fps_overlay_visible)
-				updateFpsCounter(av);
+				updateFpsCounter(av, elapsedMillis);
 			if (show_fps_counter && (lastTitleUpdateNanos == 0 || frameEndNanos - lastTitleUpdateNanos >= FPS_DISPLAY_UPDATE_INTERVAL_NS)) {
 				char titlestring[512];
 				std::snprintf(titlestring, sizeof(titlestring), "[Renderer: %s / TPF: %.3f ms / FPS: %.3f] %s%s",
@@ -842,6 +1413,43 @@ bool ONScripter::updateScrollableScrollbarDrag(int x, int y) {
 void ONScripter::endScrollableScrollbarDrag() {
 	scrollbarDragState = ScrollbarDragState();
 }
+
+/**
+ * Which input context the script is waiting in.
+ *
+ * This replaced a scan of both sprite arrays looking for a visible scrollbar.
+ * That worked, but it walked 2000 AnimationInfo of 880 bytes with the two fields
+ * it wanted on different cache lines, and measured 81 us -- half a frame's
+ * budget at 60 fps -- to answer a question that changes when somebody opens the
+ * backlog. Asking the script instead costs a handful of predictable branches.
+ */
+int ONScripter::currentInputContext() const {
+	int context = InputContextNone;
+	if (gettab_flag)
+		context |= InputContextNovel;
+	if (getmclick_flag)
+		context |= InputContextBacklog;
+	if (getpageup_flag)
+		context |= InputContextPaged;
+	if (event_mode & WAIT_BUTTON_MODE)
+		context |= InputContextMenu;
+	if (event_mode & WAIT_TEXT_MODE)
+		context |= InputContextText;
+	if (event_mode != IDLE_EVENT_MODE)
+		context |= InputContextBusy;
+	return context;
+}
+
+#if defined(DROID)
+/**
+ * Reads that from Java. Package org.umineko_project.onscripter_ru, class
+ * TouchInput -- the underscores in the package become _1 under JNI mangling.
+ */
+extern "C" JNIEXPORT jint JNICALL
+Java_org_umineko_1project_onscripter_1ru_TouchInput_nativeInputContext(JNIEnv *, jclass) {
+	return static_cast<jint>(ons.publishedInputContext());
+}
+#endif
 
 bool ONScripter::mouseMoveEvent(SDL_MouseMotionEvent &event, EventProcessingState &state) {
 	controlMode = ControlMode::Mouse;
@@ -1157,9 +1765,22 @@ bool ONScripter::touchEvent(SDL_Event &event, EventProcessingState &state) {
 }
 
 bool ONScripter::mouseScrollEvent(SDL_MouseWheelEvent &event, EventProcessingState &state) {
-	last_wheelscroll = event.y;
+	// Under SDL3 a wheel event carries a float, and a touchpad or a two-finger
+	// drag sends fractions of a tick many times a second. Keep that precision
+	// for the distance scrolled: rounding each one to a whole tick first is what
+	// makes touch scrolling move in visible jumps.
+	const float scrollTicks = static_cast<float>(event.y);
 
-	addToPostponedEventChanges("scroll scrollables", [this]() {
+	// The script-visible value stays whole ticks, unchanged: a drag that has not
+	// yet added up to one tick has not scrolled one.
+	last_wheelscroll = static_cast<int>(scrollTicks);
+
+	// Resolved here rather than inside the lambda. The lambda runs later, and it
+	// used to read last_wheelscroll at that point -- so when several wheel events
+	// arrived in one batch, every queued scroll used the last one's value.
+	const int scrollDistance = static_cast<int>(mouse_scroll_mul * scrollTicks);
+
+	addToPostponedEventChanges("scroll scrollables", [this, scrollDistance]() {
 		auto scrollSprites = [&](AnimationInfo *sprites) {
 			for (int i = 0; i < MAX_SPRITE_NUM; ++i) {
 				AnimationInfo *scrollElem = &sprites[i];
@@ -1167,7 +1788,7 @@ bool ONScripter::mouseScrollEvent(SDL_MouseWheelEvent &event, EventProcessingSta
 					continue;
 				if (scrollElem->scrollable.h > 0 && scrollElem->scrollableInfo.respondsToMouseOver) {
 					dynamicProperties.addSpriteProperty(scrollElem, scrollElem->id, scrollElem->type == SPRITE_LSP2, false,
-					                                    SPRITE_PROPERTY_SCROLLABLE_Y, mouse_scroll_mul * last_wheelscroll, 100, 1, true);
+					                                    SPRITE_PROPERTY_SCROLLABLE_Y, scrollDistance, 100, 1, true);
 					scrollElem->scrollableInfo.snapType = AnimationInfo::ScrollSnap::NONE;
 				}
 			}
@@ -1176,11 +1797,11 @@ bool ONScripter::mouseScrollEvent(SDL_MouseWheelEvent &event, EventProcessingSta
 		scrollSprites(sprite2_info);
 	});
 
-	if (event.y > 0 &&
+	if (scrollTicks > 0 &&
 	    ((event_mode & WAIT_TEXT_MODE) ||
 	     (usewheel_flag && (event_mode & WAIT_BUTTON_MODE)))) {
 		state.buttonState.set(-2);
-	} else if (event.y < 0 &&
+	} else if (scrollTicks < 0 &&
 	           ((enable_wheeldown_advance_flag && (event_mode & WAIT_TEXT_MODE)) ||
 	            (usewheel_flag && (event_mode & WAIT_BUTTON_MODE)))) {
 		state.buttonState.set((event_mode & WAIT_TEXT_MODE) ? 0 : -3);
@@ -1996,11 +2617,12 @@ void ONScripter::runEventLoop() {
 						addToPostponedEventChanges([this, state]() { current_button_state = state.buttonState; skip_mode = state.skipMode; });
 						break;
 
+#endif
+
 					case SDL_MOUSEWHEEL:
 						ret = mouseScrollEvent(event->wheel, state);
 						addToPostponedEventChanges([this, state]() { current_button_state = state.buttonState; });
 						break;
-#endif
 
 					case SDL_JOYDEVICEADDED:
 						joyCtrl.handleDeviceAdded(event->jdevice.which);

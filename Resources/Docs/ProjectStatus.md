@@ -7,7 +7,9 @@ history belongs in Git, issues, and release notes rather than this document.
 
 - Current release: 1.3 (`20260824-new`).
 - Windows 10 or newer, x86-64, built in MSYS2 UCRT64.
-- Android 11 or newer (API 30), arm64.
+- Android 11 or newer (API 30), arm64. Exercised on 15 and 16; see the
+  device-coverage note in `Resources/Docs/Android.md` for what the floor has and
+  has not been tested against.
 - The SDL3/SDL3_GPU renderer is the only supported renderer.
 
 The obsolete SDL2-based Xcode project has been removed so it can no longer
@@ -58,6 +60,12 @@ multi-window changes cannot be overwritten by whole-display geometry.
 Vulkan device creation requests only the baseline features the renderer uses,
 avoiding device-specific failures on GPUs without SDL's optional clip-distance,
 depth-clamping, indirect-first-instance, or anisotropy features.
+Background lifecycle signals now suspend presentation and idle the main loop,
+and low-memory signals evict rebuildable CPU caches and unused pooled GPU
+images on the render thread. The opt-in `perf-overlay` reports frame pacing,
+CPU, resident memory, and image-pool usage. Android touch input uses the
+engine's published wait context for backlog-only controls, including precise
+two-finger scrolling, momentum, and scrollbar-arrow paging.
 Host-side Android tests lock down the selected-root and legacy app-scoped path
 mapping.
 

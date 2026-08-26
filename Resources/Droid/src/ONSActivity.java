@@ -4,11 +4,13 @@ import android.annotation.SuppressLint;
 import android.content.pm.ActivityInfo;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.Display;
 import android.view.MotionEvent;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
 
@@ -21,6 +23,11 @@ import java.util.Arrays;
 
 public class ONSActivity extends SDLActivity implements TouchInput.SurfaceMapper {
     private static final String C = "ONSActivity";
+
+    /** The rate the engine also caps itself at; see DROID_MAX_AUTO_FPS. */
+    private static final float TARGET_REFRESH_RATE_HZ = 60.0f;
+    /** Never drop the panel below this chasing 60 on an odd set of modes. */
+    private static final float MIN_REFRESH_RATE_HZ = 50.0f;
 
     private TouchInput touchInput;
 
@@ -81,6 +88,64 @@ public class ONSActivity extends SDLActivity implements TouchInput.SurfaceMapper
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerBackCallback();
         }
+
+        preferSixtyHertz();
+    }
+
+    /**
+     * Ask the panel to run at 60Hz while the game is on screen.
+     *
+     * The engine paces the scene to whatever refresh rate it detects, and a
+     * visual novel has nothing to show for the 120 or 144Hz a modern panel
+     * offers -- it just costs battery, in the engine, the GPU and the display
+     * alike. The engine caps itself at 60 as well; this makes the panel agree,
+     * so every frame is shown for a whole number of refreshes instead of
+     * juddering against a rate it does not divide.
+     *
+     * Only the refresh rate is chosen here. Picking a mode with a different
+     * resolution would move the surface out from under the canvas geometry, so
+     * candidates are restricted to the size already in use.
+     */
+    private void preferSixtyHertz() {
+        Display display = getDisplay();
+        if (display == null) {
+            Diag.i(C, "not attached to a display yet; leaving refresh rate alone");
+            return;
+        }
+        Display.Mode current = display.getMode();
+
+        Display.Mode best = null;
+        for (Display.Mode mode : display.getSupportedModes()) {
+            if (mode.getPhysicalWidth() != current.getPhysicalWidth()
+                    || mode.getPhysicalHeight() != current.getPhysicalHeight()) {
+                continue;
+            }
+            if (mode.getRefreshRate() < MIN_REFRESH_RATE_HZ) {
+                continue;
+            }
+            if (best == null || isCloserToSixty(mode.getRefreshRate(), best.getRefreshRate())) {
+                best = mode;
+            }
+        }
+
+        if (best == null) {
+            return;
+        }
+
+        WindowManager.LayoutParams lp = getWindow().getAttributes();
+        lp.preferredDisplayModeId = best.getModeId();
+        getWindow().setAttributes(lp);
+        Diag.i(C, "requested " + best.getRefreshRate() + "Hz (was " + current.getRefreshRate() + "Hz)");
+    }
+
+    /** Prefers the rate nearer 60, and the lower one when a tie splits it. */
+    private static boolean isCloserToSixty(float candidate, float incumbent) {
+        float candidateDelta = Math.abs(candidate - TARGET_REFRESH_RATE_HZ);
+        float incumbentDelta = Math.abs(incumbent - TARGET_REFRESH_RATE_HZ);
+        if (candidateDelta != incumbentDelta) {
+            return candidateDelta < incumbentDelta;
+        }
+        return candidate < incumbent;
     }
 
     @RequiresApi(api = Build.VERSION_CODES.TIRAMISU)

@@ -19,11 +19,14 @@ when, read the git log.
   - [Why the first build is slow](#why-the-first-build-is-slow)
 - [Build environment](#build-environment)
   - [Line endings](#line-endings)
+  - [Windows pitfalls](#windows-pitfalls)
+  - [Gradle wrapper provenance](#gradle-wrapper-provenance)
   - [NDK discovery](#ndk-discovery)
 - [Supported target](#supported-target)
 - [Native architecture](#native-architecture)
 - [Java to native contract](#java-to-native-contract)
   - [The Java layer is not a launcher](#the-java-layer-is-not-a-launcher)
+  - [Touch input](#touch-input)
   - [SDL version lock](#sdl-version-lock)
   - [How complete the SDL3 port is](#how-complete-the-sdl3-port-is)
   - [Why paths are passed as arguments, not environment variables](#why-paths-are-passed-as-arguments-not-environment-variables)
@@ -41,6 +44,8 @@ when, read the git log.
 - [Debugging](#debugging)
   - [Log tags](#log-tags)
   - [Engine logging on Android](#engine-logging-on-android)
+  - [Profiling and CPU accounting](#profiling-and-cpu-accounting)
+- [The on-screen performance counter](#the-on-screen-performance-counter)
   - [Always force-stop between launches](#always-force-stop-between-launches)
   - [Test a Java-only change without a native rebuild](#test-a-java-only-change-without-a-native-rebuild)
   - [Test a link-flag change without relinking](#test-a-link-flag-change-without-relinking)
@@ -229,6 +234,8 @@ release packaging; it stages a copy of this same Gradle project under
 | Build fails in `:syncEngineLibs` with `No engine binary found` | No engine binary yet. Do step 1. |
 | Build fails in `:checkEngineFreshness` with `Engine sources are newer` | A C++ change has not been compiled. Run `make`, or `-PallowStaleEngine` to ignore. |
 | `INSTALL_FAILED_UPDATE_INCOMPATIBLE` | An existing install was signed with a different key. `adb uninstall org.umineko_project.onscripter_ru` first. |
+| `INSTALL_FAILED_VERSION_DOWNGRADE` | The device has a higher `versionCode`, usually from a branch that merged a release bump. `adb install -r -d` downgrades and keeps app data. |
+| `adb install` hangs with no output | The device is locked. Some OEMs (Xiaomi seen) block USB installs while locked and leave `pm` waiting rather than failing. Wake and unlock, then retry. Check with `dumpsys power \| grep mWakefulness`. |
 | `Unable to strip the following libraries` | Benign. AGP has no NDK; the APK is packaged unstripped. |
 | `Invalid launch directory!` then exit | No game data at the scoped path. Do step 3. |
 | `UnsatisfiedLinkError` on a `native` method | The library failed to load entirely. Read the `dlopen failed:` line from `nativeloader`, not the stack trace. |
@@ -404,7 +411,13 @@ overrides are load-bearing; removing any of them breaks startup.
 | --- | --- | --- |
 | `getLibraries()` | `{"main"}` | No `libSDL3.so` exists |
 | `getMainFunction()` | `"main"` | Engine exports `main`, not `SDL_main` |
-| `getArguments()` | `{"--root", <scoped path>, "--hwdecoder", "off"}` | Selects storage and avoids unrecoverable MediaCodec loss after backgrounding |
+| `getArguments()` | `{"--root", <game folder>, "--hwdecoder", "off"}` | Names the folder, and forces software video decode |
+| `onCreate()` | — | Claims Back, relaxes orientation on large screens, asks the panel for 60Hz |
+
+`--root` is the user-selected folder when one is configured and the app-scoped
+directory otherwise, not always the scoped path. `--hwdecoder off` is not a
+preference: see the MediaCodec entry in the backlog for why hardware decode
+cannot currently survive being backgrounded.
 
 ### The Java layer is not a launcher
 
@@ -413,32 +426,79 @@ application. It is not. Android exposes no way for native code to obtain a
 window, input events or an audio device on its own, so the Java side owns all of
 it and bridges back over JNI. Current size:
 
-| File | Lines | Native methods |
+| Vendored SDL3 | Lines | `native` methods |
 | --- | --- | --- |
-| `SDLActivity.java` | 2260 | 56 |
+| `SDLActivity.java` | 2260 | 44 |
 | `SDLControllerManager.java` | 1010 | 10 |
-| `HIDDeviceBLESteamController.java` | 829 | 1 |
+| `HIDDeviceBLESteamController.java` | 829 | 0 |
 | `HIDDeviceManager.java` | 698 | 8 |
 | `SDLSurface.java` | 464 | 0 |
 | `HIDDeviceUSB.java` | 354 | 0 |
 | `SDLInputConnection.java` | 135 | 2 |
 | `SDLAudioManager.java` | 126 | 3 |
-| `SDL.java` | 90 | 2 |
-| `ONSActivity.java` | 326 | 1 |
+| `SDL.java` | 90 | 0 |
 | `SDLDummyEdit.java` | 65 | 0 |
 | `SDLSensorManager.java` | 31 | 0 |
 | `HIDDevice.java` | 21 | 0 |
 
-That is ~6400 lines and 82 native entry points covering the rendering surface,
-touch/key/mouse/gamepad input, sensors, IME and soft keyboard, audio device
-lifecycle, USB and Bluetooth HID, clipboard, permissions, and translation of the
-activity lifecycle into SDL events. Treat it as a port layer, not glue.
+That vendored half is ~6080 lines and 67 native entry points covering the
+rendering surface, touch/key/mouse/gamepad input, sensors, IME and soft
+keyboard, audio device lifecycle, USB and Bluetooth HID, clipboard, permissions,
+and translation of the activity lifecycle into SDL events. Treat it as a port
+layer, not glue. Replace it wholesale on an SDL upgrade rather than editing
+it -- carrying forward the one intentional local patch, the message-box
+completion guard in `SDLActivity`, which releases a native thread blocked on
+a dialog when the activity is torn down.
 
-The nine launcher, storage, input, and diagnostic classes named in Tier 1 below
-are project code. The SDL-prefixed activity, surface, audio, controller, HID,
-and input classes are vendored SDL3 sources and should normally be replaced
-wholesale on an SDL upgrade; the local message-box completion guard is the one
-intentional patch and must be carried forward when that happens.
+| Project-owned | Lines | Role |
+| --- | --- | --- |
+| `TouchInput.java` | 742 | Fingers re-emitted as mouse events; gestures |
+| `ONSActivity.java` | 391 | The SDL contract, Back, orientation, refresh rate |
+| `CrashReport.java` | 243 | Report capture, and `ApplicationExitInfo` recovery |
+| `GameStorage.java` | 214 | Tree URI to path, permission state, save layout |
+| `SetupActivity.java` | 217 | Launcher: permission, folder picker, handoff |
+| `Diag.java` | 124 | Logging on `ONSJava`, plus the uncaught handler |
+| `RestartActivity.java` | 90 | Clean engine restart after a folder change |
+| `CrashActivity.java` | 93 | Shows the last report |
+| `ONSApplication.java` | 19 | Installs the crash handler before any activity |
+
+Nine project-owned files, ~1820 lines, all of `Resources/Droid/src` that is
+safe to edit. Twenty-one Java sources in total.
+
+### Touch input
+
+The engine speaks mouse. `TouchInput` sits in front of SDL's own touch handling
+and re-emits fingers as mouse events, because the engine's Android dispatch
+turns SDL finger events into position-only updates -- there is no touch path to
+its buttons.
+
+| Gesture | Sends | Notes |
+| --- | --- | --- |
+| Tap | Left click at the point | Preceded by a move, or it lands on no button |
+| Two-finger tap | Right click | Menu |
+| Long press | Right click | 400 ms, held still |
+| Two-finger drag | Wheel, proportional | 100 px of finger per tick, with momentum |
+| Three-finger tap | Middle click in the backlog, skip elsewhere | Context-dependent |
+| Scrollbar arrow (backlog) | Page up/down, repeating while held | Backlog only |
+
+Two details are worth knowing before changing any of it. The engine groups
+simultaneous fingers within 80 ms to decide a button, so a two-finger tap is two
+finger-ups in quick succession rather than a particular finger id. And a left
+click resolves against `hoveringButton`, which only `mouseMoveEvent` updates, so
+every click has to be preceded by a move or it hits nothing.
+
+The last two rows change meaning by where the game is. They ask the engine
+through `TouchInput.nativeInputContext`, which returns the mask described in
+`ONScripter::InputContext` -- see `currentInputContext` for how the script's own
+`get*_flag` declarations name the screen. Outside the backlog the scrollbar
+boxes are not consulted at all, so they cannot misfire on artwork that happens
+to sit under them.
+
+The scrollbar arrow boxes are canvas fractions, not pixels, mapped back through
+the engine's own geometry (largest whole-script scale that fits, centred,
+letterboxed), so they hold at any surface size. They are far larger than the
+glyphs they cover, which is affordable precisely because they only exist while
+the backlog is up.
 
 ### SDL version lock
 
@@ -641,17 +701,35 @@ Scripts/quickdroid.tool   multi-ABI build driver
 ### Tier 2 — shared files with Android-only regions
 
 Edit shared files only inside `#if defined(DROID)` guards unless a platform-
-neutral refactor is independently verified:
+neutral refactor is independently verified (62 sites across 19 files):
 
 ```
 Engine/Media/HardwareDecoder.cpp     MediaCodec hwaccel, JNI vm registration
 Engine/Media/VideoDecoder.cpp, Controller.hpp
-Engine/Graphics/GPU.cpp, GPU.hpp, SDL3GPUCompat.cpp, SDL3GPUCompat.hpp
-Engine/Core/ONScripter.cpp, Command.cpp, CommandExt.cpp
-Engine/Core/Event.cpp, Loader.cpp, Animation.cpp
+Engine/Graphics/GPU.cpp, GPU.hpp
+Engine/Graphics/SDL3GPUCompat.cpp, SDL3GPUCompat.hpp
+                                     surface geometry staleness, presentation
+                                     suspend while the surface is gone
+Engine/Core/ONScripter.cpp, ONScripter.hpp
+                                     lifecycle event watch and the flags it sets
+Engine/Core/Command.cpp, CommandExt.cpp
+Engine/Core/Event.cpp                frame loop: background idle, 60fps cap,
+                                     event thread wait, memory trim
+Engine/Core/Loader.cpp, Animation.cpp
 Engine/Components/Window.cpp, Window.hpp
+                                     applySurfaceGeometry and the changeMode
+                                     path that calls it
+Engine/Components/Fonts.cpp          the monospace face the performance
+                                     counter draws with
 Support/FileIO.cpp                   storage paths, __android_log logging
 External/Compatibility.hpp
+```
+
+Regenerate that inventory rather than trusting it, since it drifts:
+
+```sh
+grep -rln 'defined(DROID)\|#ifdef DROID' Engine/ Support/ External/ \
+  --include=*.cpp --include=*.hpp
 ```
 
 Build files with Android-only regions: the `*clang*:"Droid")` branch of
@@ -662,6 +740,11 @@ Build files with Android-only regions: the `*clang*:"Droid")` branch of
 
 Everything else, including unguarded shared renderer code, `Tests/`,
 `Resources/Windows/` and `Support/Apple/`.
+
+`Engine/Graphics/SDL3GPUCompat.*` used to be listed here as off-limits. It is
+not, and cannot be: the surface really does disappear out from under the
+renderer on Android, and that has to be handled where the swapchain lives. The
+rest of `Engine/Graphics/SDL3GPUShaders/` remains tier 3.
 
 ## Debugging
 
@@ -686,7 +769,7 @@ The handoff is explicit. `ONSActivity` logs the exact `argv` immediately before
 `nativeRunMain`, and the engine's first line follows it:
 
 ```
-ONSJava      : ONSActivity: handing off to engine, argv [--root, /storage/.../ONScripter-RU]
+ONSJava      : ONSActivity: handing off to engine, argv [--root, /storage/..., --hwdecoder, off]
 ONScripter-RU: Launched with pid 10854, previous pid 0
 ONScripter-RU: set:archive_path: "/storage/.../ONScripter-RU/"
 ONScripter-RU: Invalid launch directory!
@@ -722,6 +805,120 @@ library failed to load, not that the method is missing. The named method is
 simply the first JNI call attempted. Always read the `dlopen failed:` line above
 it rather than trusting the stack trace.
 
+### Profiling and CPU accounting
+
+`simpleperf` needs no root, but it does need the app's own context. Profiling
+from the shell domain is refused even where `perf_event_paranoid` is `-1`:
+
+```sh
+adb shell simpleperf record --app org.umineko_project.onscripter_ru \
+  -e cpu-clock -f 200 -g --duration 10 -o /data/local/tmp/p.data
+adb shell simpleperf report -i /data/local/tmp/p.data --sort dso,symbol -n
+```
+
+Hardware events are frequently unavailable on consumer devices; `cpu-clock` is
+the fallback that works. On one of the two test devices even that is refused
+(`Event type 'cpu-clock' is not supported`), so profiling is a per-device
+capability, not a given. A `userdebug` build (`getprop ro.build.type`) can also
+grant full `adb root` once *Rooted debugging* is enabled in developer options,
+which is what makes `debuggerd -b` and kernel symbols available.
+
+Without any of that, `/proc` answers most questions and needs no permissions:
+
+```sh
+PID=$(adb shell pidof org.umineko_project.onscripter_ru)
+adb shell "cat /proc/$PID/task/*/comm"          # thread names
+adb shell "awk '{print \$14+\$15}' /proc/$PID/task/<tid>/stat"   # jiffies
+adb shell "grep ctxt /proc/$PID/task/<tid>/status"
+```
+
+`voluntary_ctxt_switches` is the one to reach for when a thread is suspected of
+spinning. A thread that genuinely waits increments it on every sleep; a busy
+loop leaves it flat while `nonvoluntary_ctxt_switches` climbs. That, plus a run
+state of `R` in field 3 of `stat` across repeated samples, is proof of a spin
+without a profiler. It is how `SDL_WaitEventTimeout` was found not to block on
+Android.
+
+For memory, `dumpsys meminfo <pid>` splits the app into `Native Heap` and
+`GL mtrack`, the latter being graphics allocations the kernel can neither swap
+nor compress. Compare it against the engine's own count of live GPU images
+before assuming the engine is what holds it — see the backlog entry, where those
+two numbers differ by a factor of three.
+
+### The on-screen performance counter
+
+The engine can draw a panel over the game with frame timing, CPU, memory and GPU
+image accounting. It is **off by default** and there is no way to reach it by
+accident: it exists only when the configuration asks for it.
+
+Turn it on with a bare line in the game folder's `ons.cfg`:
+
+```
+perf-overlay
+```
+
+`ons.cfg` goes through the same parser as the command line, so `--perf-overlay`
+on a desktop argv does the same thing. On Android that config file is the only
+route -- there is no argv the user can edit, and the Alt+F toggle is compiled
+out on this platform anyway. `adb shell` can write it:
+
+```sh
+adb shell "printf 'perf-overlay\n' >> /storage/emulated/0/<game folder>/ons.cfg"
+```
+
+The panel reports, top to bottom:
+
+| Row | Meaning |
+| --- | --- |
+| `FPS` | Smoothed rate, then the best and worst frame across the whole history |
+| graph | One bar per presented frame, oldest at the left, 150 frames of history. Full scale is twice the frame budget and the midline is the budget itself, so a bar in the upper half is a frame that missed. Green is inside budget, amber up to 1.5x, red beyond |
+| `FRAME` | Smoothed frame time, the worst in the history, and the budget derived from the current refresh rate |
+| `CPU` | Process CPU, then the engine main loop alone, then the core count. Summed across threads, the top(1) convention -- 800 per cent is a fully busy eight-core device, and `loop` near 100 means the main thread is never idle |
+| `RSS` | Resident set size, and the live GPU image bytes the engine knows about |
+| `IMG` | Live GPU images, and what the temporary image pools are holding |
+
+`RSS` and `GPU` are the two numbers worth watching together: `RSS` is what the
+kernel charges the process, the engine's own GPU figure is what it can account
+for, and the difference is the driver allocation the backlog entry is about.
+`CPU` cross-checks against `top -b -n 1 -p $(adb shell pidof <pkg>)`, and the
+engine's `RSS` should match that row's `RES` exactly.
+
+The panel is set in a fixed-advance face, so the columns hold still as the
+digits change. On Android that is `/system/fonts/DroidSansMono.ttf`, loaded
+straight from the path into font slot 10 -- deliberately outside `fonts_number`,
+so nothing that walks the game fonts can reach it and a script asking for font
+10 still gets the missing-font path. DroidSansMono is what the `monospace`
+family resolves to in `/system/etc/fonts.xml`. Roboto Mono is *not* a safe
+choice: an Android 15 device with 208 system fonts carried DroidSansMono and
+CutiveMono and no Roboto Mono at all.
+
+No paths are listed for the desktops. Locations there vary by distribution,
+release and packaging, and this tree is only ever built for Android, so a table
+of them would be a guess that looked verified and failed quietly on the first
+machine that disagreed.
+
+The fallback is font 0, the game's `default.ttf`, which the engine refuses to
+start without and which turns out to serve. In Umineko it is Sazanami Gothic;
+a Japanese face is not fixed pitch taken as a whole, since its CJK glyphs are
+double width and its `isFixedPitch` flag is duly 0, but its halfwidth Latin is.
+Measured over all 44 characters the counter can draw, every advance is 603/1000
+em against DroidSansMono's 600, and the 500 px panel absorbs the difference. A
+title whose `default.ttf` breaks that loses only the steady columns.
+
+Sampling is cheap by construction. The frame history takes one number per frame;
+everything else -- the `/proc` read and the pool walk, which are the parts with a
+real cost -- is sampled twice a second, and the panel texture is rebuilt four
+times a second rather than per frame.
+
+What is *not* cheap is a consequence of showing an overlay at all: while it is
+visible the engine flushes the whole scene every frame, because something on
+screen is changing even when the game is idle. Attempts to measure that cost on
+the title screen were inconclusive -- two runs with the counter off gave 105-113
+per cent and 48-52 per cent CPU for the identical scene, so the run-to-run spread
+of the scene is larger than whatever the counter adds. Treat the absolute numbers
+as valid and comparisons against a counter-off run as unreliable, and prefer
+`top` or `simpleperf` when the question is what the game costs without it.
+
 ### Always force-stop between launches
 
 `Engine/Core/Loader.cpp` compares the current pid against a static `previousPid`
@@ -743,7 +940,8 @@ destination is rewritten as a Windows path.
 The native build takes hours; changes confined to `Resources/Droid/src` do not
 need it. Reuse the existing `libmain.so` and swap only the dex: compile the Java
 sources with `javac --release 17` against the platform `android.jar`, dex them
-with `d8 --min-api 30`, replace `classes.dex` inside a copy of the APK, then
+with `d8 --min-api 30` (match `minSdk` in `build.gradle`, or the dex is rejected
+on older devices), replace `classes.dex` inside a copy of the APK, then
 `zipalign -f -p 4` and re-sign with `apksigner`. On Windows those build-tools
 binaries need Windows-style paths — convert with `cygpath -w`. The re-signed APK
 will not match the release signature, so uninstall the old one first.
@@ -815,10 +1013,63 @@ platform then SIGKILLs is recorded as `reason=2 (SIGNALED) status=9` and never
 reported. Note a Back-triggered exit records as `reason=1 (EXIT_SELF)`, so
 crashes during a voluntary exit are invisible by design.
 
-**`eventQueueQueue` sits at 90–97% CPU.** Observed consistently across healthy
-runs, not only failing ones, so it is not a symptom of the decode bug. In the
-steady state it costs more than software video decoding does. Looks like a
-busy-wait rather than work; unconfirmed as a defect, worth profiling.
+**Half the foreground CPU goes on shaders the GPU never runs.** A `simpleperf`
+profile of the engine idling on the title screen, after the frame rate was
+capped at 60, attributes roughly a quarter of samples to `cpuShaderTriangles`,
+`sampleSlot`, `evaluateShaderPixel` and `blendPixel`, and another quarter to
+`unordered_map<std::string, SDL3GPUUniformValue>::find` with its `memcmp`,
+`strlen` and murmur hashing.
+
+Both come from one place. When a program has no `nativeFragmentShader`,
+`renderNativeIndexedTriangles` falls back to `cpuShaderTriangles` and evaluates
+the shader per pixel on the CPU. Inside that loop `evaluateShaderPixel` calls
+`uniformInt(program, "constant_mask")`, `"mask_value"`, `"crossfade"` and the
+rest, each one hashing a string and walking a map, per pixel.
+
+Two fixes, of very different sizes. The uniform lookups are loop-invariant per
+draw call and hoisting them into a plain struct is contained, cross-platform,
+and worth about a quarter of foreground CPU on its own. Removing the software
+path altogether means supplying native fragment shaders for the programs that
+lack them, which is real work but is what stops the CPU rendering at all.
+
+**Graphics memory is ~370 MB and only a quarter of it is accounted for.** With
+the game idle on the title screen `dumpsys meminfo` reports 368 MB under
+`GL mtrack`, while the engine's own census of every live `GPU_Image` totals
+88–125 MB across 9–13 images, pooled render targets included, and 0 KB of CPU
+side pixel copies. The engine's textures are therefore not the problem — the
+largest single one is a 32 MB 2048×4096 render target and the rest are canvas
+and script sized targets, all plausible.
+
+Both halves of that comparison are now on screen together: the performance
+counter's `RSS` and `GPU` rows are the same two numbers, live, so the gap can
+be watched as the scene changes rather than sampled by hand.
+
+That leaves roughly 250–280 MB allocated below the engine, in SDL_GPU or the
+Mali driver, and unattributed. Known candidates worth measuring before anything
+is changed: the swapchain (2800×2000×4 is 22 MB an image, and there are at least
+three), the two `SDL3GPUReusableTransferBuffer` staging buffers, which grow to
+the largest upload ever made and are never shrunk — a 32 MB texture leaves a
+32 MB buffer behind — and whether `imagePixelBytes` counts mip levels.
+
+This matters because it is device memory: it cannot be swapped or compressed,
+which is why ColorOS logs `osense.compress ... cur ratio = 0` against this
+process every 20 s and reclaims nothing, and why the process is the first thing
+the low memory killer reaches for.
+
+**The same idle scene costs anywhere from 48% to 113% CPU between runs.**
+Measured while trying to establish what the performance counter itself costs.
+Two runs of the identical build, identical configuration and the identical title
+screen, reached the same way, gave 105-113% and 48-52% of a core; a third at
+64-67% differed only in having the counter on. `RES` differed too (345-403 MB),
+and cumulative CPU at the sampling point differed by a third, which points at
+background asset loading still running in some runs and not others rather than
+at DVFS or thermals.
+
+Two consequences. Any A/B on this scene needs many more than one run per arm to
+mean anything -- the counter's own overhead could not be measured at all against
+this spread. And if the variance really is deferred loading, then something is
+either doing avoidable work or finishing at an unpredictable point, which is
+worth understanding on its own.
 
 **Resume can stay black for several seconds.** Returning from another app, one
 observation showed ~6 s between `did enter foreground` and `Swapchain rebuilt
@@ -827,6 +1078,19 @@ screen has nothing to flip. Single observation, and worth re-measuring now that 
 failed swapchain reclaim is retried rather than abandoned.
 
 ### Features
+
+**The performance counter forces a full scene flush every frame it is visible.**
+`waitEvent` recomposites the whole scene whenever `fps_overlay_visible` is set
+and `screenChanged` is false, so an otherwise idle screen is redrawn at the frame
+rate purely to keep the panel on top of it. That is pre-existing behaviour of the
+old fps overlay, inherited by the counter.
+
+The panel texture is only rebuilt when its text changes, four times a second, so
+the flush could be gated on `fps_overlay_dirty` instead and the scene recomposited
+at the same cadence. The care needed is that `drawFpsOverlay` sets `screenChanged`
+unconditionally, and `screen_target` is cleared after each flip -- so simply
+skipping the flush would present a panel on an empty frame. Worth doing: a
+measurement tool that inflates idle cost is measuring itself.
 
 **Touch targets are below Android's minimum.** Everything renders into a fixed
 1920×1080 script space scaled uniformly to the window, and button geometry is
@@ -884,9 +1148,11 @@ Worth building a device matrix and working through it deliberately:
 
 - **GPU vendor** — Adreno and Mali are covered. PowerVR and Samsung Xclipse are
   not, and each has its own view of which optional Vulkan features exist.
-- **Android version** — 11–13 still need coverage, while 14, 15 and 16 already
-  behave differently in ways that matter: `enableOnBackInvokedCallback` changes
-  how Back is delivered on 33+, and 16 ignores manifest-declared fixed
+- **Android version** — the floor is 11 (API 30) but only 15 and 16 have ever
+  been run, so the whole 11 to 14 range is untested. The differences already
+  biting us are at the edges of that range: `enableOnBackInvokedCallback`
+  changes how Back is delivered on 33+, so 30 to 32 take the `onBackPressed`
+  path no test device can reach, and 16 ignores manifest-declared fixed
   orientation on large screens.
 - **Form factor** — phone, tablet, foldable, TV. Touch-target sizing and
   orientation handling differ; a TV has no touch at all.
@@ -912,15 +1178,35 @@ shipped binary rather than the source tree.
   regression corpus does, which limits confidence in renderer and media changes.
   `Tests/Fixtures/SmokeGame/0.txt` is a minimal script, not a runnable game — the
   engine still reports `Invalid launch directory!` with only that present.
-- `android:screenOrientation="sensorLandscape"` is ignored on targetSdk 36;
-  Android 16 drops manifest-declared fixed orientation on large screens.
+- `android:screenOrientation="sensorLandscape"` in the manifest is ignored on
+  targetSdk 36, because Android 16 drops manifest-declared fixed orientation on
+  large screens. `ONSActivity.onCreate` therefore sets orientation in code. The
+  manifest attribute is still worth keeping: it stops a phone flashing portrait
+  for a frame before that code runs.
 - `Resources/Droid/gradle/gradle-daemon-jvm.properties` is untracked and
   undecided. Gradle generates it, and it pins JDK 25 with foojay download URLs,
   which would impose that toolchain on every contributor. Commit or gitignore.
 
 ### Unverified
 
-Behaviours never exercised, as opposed to the hardware axes above: long
-backgrounding where Android kills the process outright; incoming phone calls;
-split screen; and whether the three-finger swipes reach the intended engine state
-in every mode — they fire and are logged, which is all that has been confirmed.
+The performance counter's font fallback has never been exercised on a device.
+Every handset tested had `/system/fonts/DroidSansMono.ttf`, so the path where no
+system monospace face is found and the panel draws with font 0 has only been
+reasoned about -- though the claim it rests on was measured rather than assumed:
+`default.ttf`'s Latin advances were read out of the font file and are uniform.
+
+Behaviours never exercised, as opposed to the hardware axes above: incoming
+phone calls; recovery after Android kills the backgrounded process outright,
+which is now much rarer but still ends the session with no autosave to return
+to; and whether the three-finger swipes reach the intended engine state in every
+mode — they fire and are logged, which is all that has been confirmed.
+
+Split screen and floating windows *have* been exercised on the tablet, along
+with rotation and cold start against a sleeping display, and the canvas geometry
+holds in all of them.
+
+Backgrounding has been measured rather than guessed at, and the numbers belong
+with the kill discussion above: the process now idles at 5% of one core while
+backgrounded, against 110% before, which is what took it under Android's 25%
+cached-process CPU limit. What has *not* been re-tested is a full memory-pressure
+kill and the return from it.

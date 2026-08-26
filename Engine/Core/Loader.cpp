@@ -154,6 +154,7 @@ void *__wrap_SDL_LoadObject(const char *sofile) {
 	printf("     --debug                      generate runtime debugging output (use multiple times to increase debug level)\n");
 	printf("     --check-file-case            attempt to check file case on case-insensitive file systems\n");
 	printf("     --show-fps                   display a ms/frame counter in the window title\n");
+	printf("     --perf-overlay               draw the performance counter (fps, frame times, cpu, memory)\n");
 	printf("     --force-fps value            override all fps changes to this value\n");
 	printf("     --discord-app-id id          enable Discord Rich Presence with this application ID\n");
 	printf("     --disable-discord-rich-presence disable Discord Rich Presence\n");
@@ -380,6 +381,9 @@ static void parseOptions(int argc, char **argv, bool &hasArchivePath) {
 			} else if (!std::strcmp(argv[0] + 1, "-show-fps")) {
 				ons.setShowFPS();
 				ons.ons_cfg_options["show-fps"] = "noval";
+			} else if (!std::strcmp(argv[0] + 1, "-perf-overlay")) {
+				ons.setPerfOverlay();
+				ons.ons_cfg_options["perf-overlay"] = "noval";
 			} else if (!std::strcmp(argv[0] + 1, "-force-fps")) {
 				argc--;
 				argv++;

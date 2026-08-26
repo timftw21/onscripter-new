@@ -128,7 +128,23 @@ public:
 	RenderImage *getImage();         // get a fresh temporary image
 	void giveImage(RenderImage *im); // return a temporary image to the pool for reuse
 	void addImages(int n);         // pre-create some blank temporary images to avoid delays later
-	void clearUnused(bool require_empty = false);
+	size_t clearUnused(bool require_empty = false); // returns the bytes handed back to the GPU
+
+	struct Census {
+		size_t images{0};
+		size_t checkedOut{0};
+		size_t bytes{0};
+	};
+	Census census() const {
+		Census c;
+		for (const auto &entry : pool) {
+			++c.images;
+			if (entry.second)
+				++c.checkedOut;
+			c.bytes += static_cast<size_t>(entry.first->w) * entry.first->h * 4;
+		}
+		return c;
+	}
 };
 
 struct PooledGPUImage {
@@ -543,6 +559,41 @@ public:
 		canvasImagePool.clearUnused(require_empty);
 		typedImagePools.clear();
 		globalImagePool.clear();
+	}
+
+	// Where the pooled GPU memory actually sits, so a number in dumpsys can be
+	// attributed rather than guessed at.
+	void logPooledImageCensus();
+
+	// The same totals as logPooledImageCensus, returned rather than logged, for
+	// the performance counter. Walks every pooled image, so it is sampled on the
+	// panel's redraw cadence and not per frame.
+	TempGPUImagePool::Census pooledImageCensus() const {
+		TempGPUImagePool::Census total = canvasImagePool.census();
+		auto add = [&total](const TempGPUImagePool::Census &c) {
+			total.images += c.images;
+			total.checkedOut += c.checkedOut;
+			total.bytes += c.bytes;
+		};
+		add(scriptImagePool.census());
+		for (const auto &entry : typedImagePools)
+			add(entry.second.census());
+		return total;
+	}
+
+	// Hand back every pooled image nobody is holding, and report the bytes.
+	//
+	// Unlike clearImagePools this keeps the pool objects themselves, because
+	// live PooledGPUImage handles store a pointer to the pool they came from
+	// and return their image to it on destruction. It is therefore safe to call
+	// at any point in the frame, which is what the Android trim path needs.
+	size_t releaseUnusedPooledImages() {
+		size_t freedBytes = scriptImagePool.clearUnused();
+		freedBytes += canvasImagePool.clearUnused();
+		for (auto &entry : typedImagePools)
+			freedBytes += entry.second.clearUnused();
+		globalImagePool.clear();
+		return freedBytes;
 	}
 
 	RenderImage *getCanvasImage() { return canvasImagePool.getImage(); }

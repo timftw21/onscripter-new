@@ -120,6 +120,69 @@ bool FontsController::loadFont(Font &f, size_t i, bool user) {
 	return true;
 }
 
+/**
+ * Points MonospaceSlot at the host's monospace face, where we know one.
+ *
+ * Only Android is listed, because Android is the only platform this tree is
+ * actually built and run on, and these paths were checked against a device
+ * rather than recalled. /system/fonts is a fixed location and DroidSansMono is
+ * what the "monospace" family resolves to in /system/etc/fonts.xml; RobotoMono
+ * follows it rather than leading because it is not universally present -- an
+ * Android 15 handset with 208 system fonts carried DroidSansMono and CutiveMono
+ * and no Roboto Mono at all.
+ *
+ * Nothing is listed for the desktops. Font locations there vary by distribution,
+ * release and packaging, and a table nobody here compiles is a guess wearing the
+ * costume of a fact: it would sit in the tree looking verified and fail quietly
+ * on the first machine that disagreed with it.
+ *
+ * Failing costs less than such a table would. The counter then draws with font
+ * 0, the game's default.ttf, which is the one font the engine refuses to start
+ * without. In Umineko that is Sazanami Gothic, and a Japanese face is not fixed
+ * pitch taken as a whole -- its CJK glyphs are double width and its isFixedPitch
+ * flag is duly 0 -- but its halfwidth Latin is. Measured over all 44 characters
+ * the counter can draw, every advance is 603/1000 em against DroidSansMono's
+ * 600, so the columns hold still either way and the panel width still fits.
+ *
+ * A title whose default.ttf breaks that loses only the steady columns.
+ */
+bool FontsController::loadMonospaceFont() {
+#if defined(DROID)
+	static const char *const candidates[]{
+	    "/system/fonts/DroidSansMono.ttf",
+	    "/system/fonts/RobotoMono-Regular.ttf",
+	    "/system/fonts/CutiveMono.ttf",
+	};
+
+	Font &f = fonts[MonospaceSlot];
+
+	for (const char *candidate : candidates) {
+		if (!FileIO::accessFile(candidate, FileType::File))
+			continue;
+
+		// FT_New_Face rather than the stream wrapper loadFont uses: this is a
+		// plain host path, not something the archive readers have to resolve.
+		if (FT_New_Face(freetype, candidate, 0, &f.normal_face)) {
+			f.normal_face = nullptr;
+			continue;
+		}
+
+		const size_t len = std::strlen(candidate) + 1;
+		f.path           = std::make_unique<char[]>(len);
+		copystr(f.path.get(), candidate, len);
+		f.face           = f.normal_face;
+		f.loaded         = true;
+		monospaceLoaded  = true;
+		sendToLog(LogLevel::Info, "Monospace font for the performance counter: %s\n", candidate);
+		return true;
+	}
+
+#endif
+
+	sendToLog(LogLevel::Info, "No system monospace font, the performance counter falls back to the game default font\n");
+	return false;
+}
+
 int FontsController::ownInit() {
 	auto it = ons.ons_cfg_options.find("font-overrides");
 	if (it != ons.ons_cfg_options.end())
@@ -153,6 +216,8 @@ int FontsController::ownInit() {
 
 		//sendToLog(LogLevel::Info, "Path %i: %s\n", i, fonts[i].path);
 	}
+
+	loadMonospaceFont();
 
 	// Now need to take a basedir from default.ttf and use it as a font dir
 	copystr(fontdir, fonts[0].path.get(), sizeof(fontdir));

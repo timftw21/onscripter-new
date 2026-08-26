@@ -125,8 +125,18 @@ public:
 	FT_Library freetype{}; //normally private
 	size_t fonts_number{0};
 	size_t user_fonts_number{0};
-	Font fonts[10]{};
+
+	// Slots 0-9 are the game's own fonts, loaded from <game>/fonts. Slot 10 is
+	// not game data: it holds a monospace face taken from the host system for the
+	// performance counter, which wants fixed advances so the columns stop moving
+	// as the digits change. It stays empty on hosts we have no verified path for,
+	// and the counter falls back to font 0; see loadMonospaceFont. It is deliberately outside fonts_number, so nothing
+	// that walks the game fonts -- isFontLoaded, the override tables -- can reach
+	// it, and a script asking for font 10 still gets the "missing font" path.
+	static constexpr unsigned int MonospaceSlot{10};
+	Font fonts[MonospaceSlot + 1]{};
 	Font user_fonts[10]{};
+	bool monospaceLoaded{false};
 	bool glyphStorageOptimisation{false};
 
 	std::unordered_map<unsigned int, unsigned int> baseFontOverrides;
@@ -135,6 +145,7 @@ public:
 	std::unordered_map<unsigned int, std::unordered_map<unsigned int, float>> presetSizeMultipliers;
 
 	bool loadFont(Font &f, size_t i, bool user);
+	bool loadMonospaceFont();
 	void initFontOverrides(const std::string &o);
 	void initFontMultiplier(const std::string &m);
 	Font &getFont(unsigned int id, int preset_id = -1);
